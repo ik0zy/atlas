@@ -36,8 +36,10 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
           else
-            TAG="v0.3.2"
+            PKG_VER=$(node -p "require('./package.json').version")
+            TAG="v${PKG_VER}"
           fi
+
           RAW_VER="${TAG#v}"
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "version=${RAW_VER}" >> $GITHUB_OUTPUT
@@ -72,8 +74,19 @@ jobs:
       - name: Build frontend assets
         run: bun run build:vite
 
+      - name: Expand swap space
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Build Tauri native release binary
+        env:
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
         run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol
+
 
 
       - name: Package Linux release archive
