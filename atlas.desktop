@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Atlas
+Comment=Source control and workspace for coding agents
+Exec=atlas %U
+Icon=dev.atlas.ide
+Terminal=false
+Type=Application
+Categories=Development;IDE;
+StartupWMClass=Atlas
+MimeType=text/plain;inode/directory;

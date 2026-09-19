@@ -1,0 +1,109 @@
+name: Release Linux Binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.3.2)'
+        required: false
+        default: 'v0.3.2'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  LIBSQLITE3_SYS_USE_PKG_CONFIG: 1
+
+jobs:
+  build-linux:
+    name: Build Linux x86_64 Release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release version
+        id: vars
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v0.3.2"
+          fi
+          RAW_VER="${TAG#v}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${RAW_VER}" >> $GITHUB_OUTPUT
+          echo "Building Atlas release: ${TAG} (version: ${RAW_VER})"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libsqlite3-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build frontend assets
+        run: bun run build:vite
+
+      - name: Build Tauri native release binary
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Package Linux release archive
+        run: |
+          strip target/release/atlas
+          PKG_NAME="atlas-${{ steps.vars.outputs.tag }}-linux-x86_64"
+          mkdir -p "${PKG_NAME}/icons"
+          cp target/release/atlas "${PKG_NAME}/"
+          cp atlas.desktop "${PKG_NAME}/"
+          cp src-tauri/icons/32x32.png "${PKG_NAME}/icons/"
+          cp src-tauri/icons/64x64.png "${PKG_NAME}/icons/"
+          cp src-tauri/icons/128x128.png "${PKG_NAME}/icons/"
+          cp src-tauri/icons/256x256.png "${PKG_NAME}/icons/"
+          cp LICENSE "${PKG_NAME}/"
+          tar -czvf "${PKG_NAME}.tar.gz" -C "${PKG_NAME}" .
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Atlas ${{ steps.vars.outputs.tag }}
+          body: |
+            Atlas ${{ steps.vars.outputs.tag }} pre-compiled Linux binary release for x86_64.
+            
+            ### Installation on Arch Linux (AUR)
+            ```bash
+            yay -S atlas-desktop-bin
+            ```
+          draft: false
+          prerelease: false
+          files: |
+            atlas-${{ steps.vars.outputs.tag }}-linux-x86_64.tar.gz
+            atlas-${{ steps.vars.outputs.tag }}-linux-x86_64.tar.gz.sha256
