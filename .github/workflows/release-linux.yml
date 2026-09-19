@@ -74,13 +74,11 @@ jobs:
       - name: Build frontend assets
         run: bun run build:vite
 
-      - name: Expand swap space
-        run: |
-          sudo fallocate -l 10G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
 
       - name: Build Tauri native release binary
         env:
