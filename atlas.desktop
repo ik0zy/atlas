@@ -6,5 +6,5 @@ Icon=dev.atlas.ide
 Terminal=false
 Type=Application
 Categories=Development;IDE;
-StartupWMClass=Atlas
+StartupWMClass=dev.atlas.ide
 MimeType=text/plain;inode/directory;

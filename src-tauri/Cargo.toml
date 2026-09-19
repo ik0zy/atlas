@@ -24,9 +24,8 @@ tauri-build = { version = "2", features = [] }
 
 [features]
 default = []
-# The `ported-engine` switch is gone with the path it switched away from (#54).
-# The ported engine is now the only implementation of the native agent, so
-# there is nothing left to select and every build contains it.
+custom-protocol = ["tauri/custom-protocol"]
+
 
 [dependencies]
 atlas-process = { path = "../crates/atlas-process" }
