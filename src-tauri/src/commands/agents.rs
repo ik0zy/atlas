@@ -118,7 +118,9 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for BroadcastMiddleware {
     }
 }
 
-/// Manages OS power assertions to prevent idle system sleep while agents are running.
+/// Manages OS power assertions to prevent idle system sleep while agents are
+/// running. Sessions that end without a status delta are released through
+/// `SharingGatedLifecycle::session_ended`.
 struct KeepAwakeMiddleware {
     app: AppHandle,
 }
@@ -131,22 +133,7 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for KeepAwakeMiddleware {
         else {
             return;
         };
-        match &envelope.delta {
-            SessionDelta::Status { status, .. } => {
-                if *status == SessionStatus::Running {
-                    manager.mark_running(&envelope.session_id);
-                } else {
-                    manager.mark_not_running(&envelope.session_id);
-                }
-            }
-            SessionDelta::TurnFinished { .. } | SessionDelta::TurnFailed { .. } => {
-                manager.mark_not_running(&envelope.session_id);
-            }
-            SessionDelta::AgentDisconnected { .. } => {
-                manager.forget_session(&envelope.session_id);
-            }
-            _ => {}
-        }
+        manager.observe(&envelope.session_id, &envelope.delta);
     }
 }
 
@@ -582,6 +569,9 @@ struct SharingGatedLifecycle {
     /// in memory, so a session's token exists as soon as its start is
     /// reported; its per-session clock is dropped when the session ends.
     server: Arc<super::memory_server::MemoryServerHost>,
+    /// Released here rather than from deltas: a session can end without a
+    /// terminal status (sign-out, killing an agent, quitting).
+    keep_awake: Option<Arc<crate::keep_awake::KeepAwakeManager>>,
 }
 
 enum LifecycleWrite {
@@ -597,6 +587,9 @@ enum LifecycleWrite {
 
 impl SharingGatedLifecycle {
     fn new(app: AppHandle, server: Arc<super::memory_server::MemoryServerHost>) -> Self {
+        let keep_awake = app
+            .try_state::<Arc<crate::keep_awake::KeepAwakeManager>>()
+            .map(|state| state.inner().clone());
         let (tx, rx) = std::sync::mpsc::channel::<LifecycleWrite>();
         std::thread::Builder::new()
             .name("atlas-session-lifecycle".into())
@@ -631,7 +624,11 @@ impl SharingGatedLifecycle {
                 }
             })
             .expect("the session lifecycle thread starts");
-        Self { writes: tx, server }
+        Self {
+            writes: tx,
+            server,
+            keep_awake,
+        }
     }
 
     fn queue(&self, write: LifecycleWrite) {
@@ -656,6 +653,9 @@ impl super::agent_host::SessionLifecycle for SharingGatedLifecycle {
 
     fn session_ended(&self, session_id: &str) {
         super::agent_host::SessionLifecycle::session_ended(&**self.server.tokens(), session_id);
+        if let Some(keep_awake) = &self.keep_awake {
+            keep_awake.session_ended(session_id);
+        }
         self.server.clocks().forget(session_id);
         self.queue(LifecycleWrite::Ended {
             session_id: session_id.to_string(),
@@ -1743,9 +1743,6 @@ pub async fn agents_drop_session(
     let _ = agent_id;
     // Release the per-turn accumulator with the session, so a tab closed
     // mid-turn doesn't hold one for the life of the process.
-    if let Some(keep_awake) = app.try_state::<Arc<crate::keep_awake::KeepAwakeManager>>() {
-        keep_awake.forget_session(&session_id);
-    }
     app.state::<Arc<AnalyticsState>>()
         .forget_session(&session_id);
     let host = app.state::<Arc<AgentHost>>().inner().clone();

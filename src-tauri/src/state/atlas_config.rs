@@ -655,7 +655,8 @@ const SETTINGS_DOCS: &[(&str, &str)] = &[
     (
         "keepAwakeWhileRunning",
         "# Keep the computer awake while an Atlas agent is actively running.\n\
-         # Prevents idle system sleep; display can still turn off. (default: false)",
+         # Prevents idle system sleep; display can still turn off. No effect on\n\
+         # Windows. (default: false)",
     ),
     (
         "autoUpdate",
