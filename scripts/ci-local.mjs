@@ -34,14 +34,18 @@
  *     applying them here would rebuild your whole target/ under a second
  *     profile and lose incremental builds.
  *   - the OS, unless asked. Every job runs on this machine by default. A job
- *     CI runs on macOS (the app) is skipped on any other OS.
+ *     CI runs on macOS (the app) is skipped on any other OS, and so is the
+ *     app's Linux compile check (OS_BOUND) except on Linux; under `--linux`
+ *     it runs in the container.
  *
  * `--linux` runs the jobs CI runs on Ubuntu in a container instead, built from
  * scripts/ci-linux/Dockerfile. It is the only local way to exercise Linux-only
  * code, the engine's bubblewrap sandbox above all, from a Mac or Windows.
  * Opt-in because the first run is a cold build: the container's target dir
- * cannot share the host's. It lives in per-checkout volumes, and so do the
- * cargo registry and a Linux `node_modules`, so later runs are incremental.
+ * cannot share the host's. It lives in a volume with the cargo registry, so
+ * later runs are incremental, and every worktree of a clone shares that one
+ * volume, so a new worktree starts warm. A Linux `node_modules` and `dist/`
+ * are kept per checkout.
  *
  *   - Any Docker-compatible runtime: `docker` by default, ATLAS_CI_DOCKER to
  *     name another (`podman`). OrbStack, Docker Desktop and Colima all serve
@@ -58,11 +62,24 @@
  *   - bubblewrap needs the container's seccomp, AppArmor and /proc masks
  *     relaxed (see sandboxOpts). Without them the engine's sandbox fails as
  *     it would on a runner without bwrap installed.
+ *   - One container per job, as CI gives each job its own VM: started when
+ *     the job starts, each step run in it with `docker exec`, removed when
+ *     the job ends (or the run is interrupted). Steps of one job share its
+ *     filesystem, `/tmp` and leftover processes included, exactly as they
+ *     share a runner in CI; nothing outside the volumes reaches the next job.
+ *   - Two lanes. The jobs left on this machine (the macOS app) run alongside
+ *     the container's, which still run one after another. The two never share
+ *     a target dir, so neither waits on the other's cargo lock and nothing is
+ *     built twice; they only share cores, and each leaves some idle (linking,
+ *     running tests). The container jobs stay sequential because they do
+ *     share one target dir. This machine's lane writes to a log file, printed
+ *     in full if it fails, so the terminal shows one stream.
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   REPO_ROOT,
@@ -80,6 +97,10 @@ if (typeof Bun === "undefined") {
 
 /** Jobs that plan or gate other jobs rather than check anything. */
 const NOT_CHECKS = new Set(["changes", "ci-ok"]);
+/** Jobs that compile for their runner's OS. Anywhere else they would repeat
+ *  the macOS `app` job's check under the wrong `cfg`, so they run only there. */
+const OS_BOUND = new Set(["app-linux"]);
+const HOST_OS = { darwin: "macos", win32: "windows" }[process.platform] ?? process.platform;
 /** A step matching this changes the machine it runs on; see the docblock. */
 const MUTATES_MACHINE = /\bsudo\b|git config --global/;
 
@@ -160,7 +181,7 @@ function plannedNames(argv) {
     dialect: dialectPackages(ciYmlText),
   });
   const names = new Set(["frontend", ...p.crates.map((c) => c.crate)]);
-  if (p.app) names.add(ciYml.jobs.app.name);
+  if (p.app) names.add(ciYml.jobs.app.name).add(ciYml.jobs["app-linux"].name);
   if (p.engineDialect) names.add(ciYml.jobs["engine-dialect"].name);
   return { names, why: `${p.reason} since ${base.slice(0, 12)}` };
 }
@@ -190,6 +211,8 @@ function checkVersions() {
 }
 
 const DOCKER = process.env.ATLAS_CI_DOCKER || "docker";
+/** Where scripts/ci-linux/Dockerfile installs entrypoint.sh. */
+const ENTRYPOINT = "/usr/local/bin/ci-linux-entrypoint";
 const IMAGE_DIR = path.join(REPO_ROOT, "scripts", "ci-linux");
 
 /**
@@ -293,12 +316,19 @@ function containerContext() {
   if (root === REPO_ROOT && !gitCommon.startsWith(REPO_ROOT + path.sep)) {
     mounts.push(`${gitCommon}:${gitCommon}`);
   }
-  // Per checkout: the target dir, cargo registry and Bun cache; a Linux
-  // node_modules (the host's holds this OS's binaries); and dist/, so a Linux
+  // Per clone, shared by all its worktrees: the target dir, cargo registry and
+  // Bun cache. Keyed by the main checkout's path, so for the main checkout the
+  // name is what it always was and its warm volume is kept. A new worktree
+  // starts from it instead of a cold build; two runs at once take turns on
+  // cargo's build lock.
+  // Per checkout: a Linux node_modules (the host's holds this OS's binaries,
+  // and worktrees can differ in their lockfile); and dist/, so a Linux
   // `bun run build` doesn't rewrite the host's.
-  const vol = `atlas-ci-${createHash("sha256").update(REPO_ROOT).digest("hex").slice(0, 8)}`;
+  const volFor = (p) => `atlas-ci-${createHash("sha256").update(p).digest("hex").slice(0, 8)}`;
+  const mainCheckout = path.basename(gitCommon) === ".git" ? path.dirname(gitCommon) : gitCommon;
+  const vol = volFor(REPO_ROOT);
   mounts.push(
-    `${vol}-cache:/cache`,
+    `${volFor(mainCheckout)}-cache:/cache`,
     `${vol}-node-modules:${root}/node_modules`,
     `${vol}-dist:${root}/dist`,
   );
@@ -320,37 +350,92 @@ function containerContext() {
   };
 }
 
-function containerRun(ctx, cwd, command, { interactive = false } = {}) {
-  const tty = interactive || (process.stdout.isTTY && process.stdin.isTTY);
-  return spawnSync(
+/** `docker run` arguments for an interactive shell (`--shell`). */
+function shellArgs(ctx) {
+  return ["run", "--rm", "--init", "-it", ...ctx.opts, "-w", ctx.root, ctx.image, "bash"];
+}
+
+/** Containers started for a job and not yet removed, for cleanup on exit. */
+const liveContainers = new Set();
+
+function removeLiveContainers() {
+  if (liveContainers.size) {
+    spawnSync(DOCKER, ["rm", "-f", ...liveContainers], { stdio: "ignore" });
+    liveContainers.clear();
+  }
+}
+process.on("exit", removeLiveContainers);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    removeLiveContainers();
+    process.exit(130);
+  });
+}
+
+/**
+ * Start a job's container, idle until its steps are exec'd into it. The
+ * entrypoint runs once here (volume ownership); each step goes back through
+ * it (see `execArgs`) for the environment and the drop to the host user.
+ */
+function startJobContainer(ctx) {
+  const r = spawnSync(
     DOCKER,
-    [
-      "run",
-      "--rm",
-      "--init",
-      ...(interactive ? ["-it"] : tty ? ["-t"] : []),
-      ...ctx.opts,
-      "-w",
-      path.posix.join(ctx.root, cwd),
-      ctx.image,
-      ...command,
-    ],
-    { stdio: "inherit" },
+    ["run", "-d", "--rm", "--init", ...ctx.opts, ctx.image, "sleep", "infinity"],
+    { encoding: "utf8" },
   );
+  const id = r.stdout?.trim();
+  if (r.status !== 0 || !id) {
+    console.error(`ci-local: could not start the container: ${r.stderr?.trim()}`);
+    return null;
+  }
+  liveContainers.add(id);
+  return id;
+}
+
+function stopJobContainer(id) {
+  spawnSync(DOCKER, ["rm", "-f", id], { stdio: "ignore" });
+  liveContainers.delete(id);
+}
+
+/**
+ * `docker exec` arguments for one step. `exec` skips the image's entrypoint,
+ * so the step runs through it explicitly: it sets HOME, CARGO_HOME and
+ * CARGO_TARGET_DIR and drops to the host user, as it does for `docker run`.
+ */
+function execArgs(ctx, id, cwd, command) {
+  const tty = process.stdout.isTTY && process.stdin.isTTY;
+  return [
+    "exec",
+    ...(tty ? ["-t"] : []),
+    "-w",
+    path.posix.join(ctx.root, cwd),
+    id,
+    ENTRYPOINT,
+    ...command,
+  ];
+}
+
+/** Run `cmd`, resolving to its exit status (1 if it could not start). */
+function run(cmd, args, opts) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, opts);
+    child.on("error", () => resolve(1));
+    child.on("close", (code) => resolve(code ?? 1));
+  });
 }
 
 /** Where a job runs: in the container, on this machine, or not at all. */
 function placement(job, linux) {
   if (job.os === "linux" && linux) return "container";
-  if (job.os === "macos" && process.platform !== "darwin") return "skip";
+  if ((job.os === "macos" || OS_BOUND.has(job.id)) && job.os !== HOST_OS) return "skip";
   return "native";
 }
 
-function main(argv) {
+async function main(argv) {
   const linux = argv.includes("--linux");
   if (argv.includes("--shell")) {
     const ctx = containerContext();
-    process.exit(containerRun(ctx, ".", ["bash"], { interactive: true }).status ?? 1);
+    process.exit(spawnSync(DOCKER, shellArgs(ctx), { stdio: "inherit" }).status ?? 1);
   }
 
   const all = ciJobs();
@@ -372,7 +457,7 @@ function main(argv) {
     console.log(`ci-local: ${jobs.length} of ${all.length} jobs (${why})`);
   }
   // Fastest feedback first: the frontend takes about a minute, the app longest.
-  const rank = { frontend: 0, crates: 1, "engine-dialect": 2, app: 3 };
+  const rank = { frontend: 0, crates: 1, "engine-dialect": 2, "app-linux": 3, app: 4 };
   jobs.sort((a, b) => (rank[a.id] ?? 1) - (rank[b.id] ?? 1));
 
   for (const j of jobs) j.where = placement(j, linux);
@@ -410,39 +495,29 @@ function main(argv) {
     env.SDKROOT = execFileSync("xcrun", ["--show-sdk-path"], { encoding: "utf8" }).trim();
   }
 
-  const results = [];
-  for (const job of jobs) {
-    if (job.where === "skip") {
-      console.log(`\n── ${job.name}: skipped (CI runs it on ${job.os})`);
-      results.push({ job: job.name, skipped: true, secs: 0 });
-      continue;
-    }
-    const started = Date.now();
-    let failed = null;
-    for (const step of job.steps) {
-      const skip = skipReason(job, step);
-      if (skip) {
-        console.log(`\n── ${job.name} › ${step.name}: skipped (${skip})`);
-        continue;
-      }
-      console.log(
-        `\n── ${job.name} › ${step.name}${job.where === "container" ? " (container)" : ""}\n   [${step.cwd}] ${step.run.replace(/\s*\n\s*/g, " ")}`,
-      );
-      const command = ["bash", "-eo", "pipefail", "-c", step.run];
-      const r =
-        job.where === "container"
-          ? containerRun(ctx, step.cwd, command)
-          : spawnSync(command[0], command.slice(1), {
-              cwd: path.join(REPO_ROOT, step.cwd),
-              env,
-              stdio: "inherit",
-            });
-      if (r.status !== 0) {
-        failed = step.name;
-        break;
-      }
-    }
-    results.push({ job: job.name, failed, secs: Math.round((Date.now() - started) / 1000) });
+  // Two lanes when both kinds of job are planned (see the docblock); one
+  // otherwise, since native jobs share this machine's target dir.
+  const here = jobs.filter((j) => j.where === "native");
+  const lanes = ctx && here.length ? [jobs.filter((j) => j.where !== "native"), here] : [jobs];
+  let log = null;
+  if (lanes.length === 2) {
+    log = path.join(tmpdir(), `atlas-ci-local-${process.pid}.log`);
+    console.log(
+      `ci-local: ${here.map((j) => j.name).join(", ")} runs on this machine alongside the container jobs; its output goes to ${log}`,
+    );
+  }
+  const done = new Map();
+  await Promise.all(
+    lanes.map(async (lane, i) => {
+      const out = i === 1 ? openSync(log, "w") : null;
+      for (const job of lane) done.set(job, await runJob(job, ctx, env, out));
+      if (out !== null) closeSync(out);
+    }),
+  );
+  const results = jobs.map((j) => done.get(j));
+  if (log && here.some((j) => done.get(j).failed)) {
+    console.log(`\n── output from this machine's lane (${log}):\n`);
+    console.log(readFileSync(log, "utf8"));
   }
 
   console.log("\nci-local summary");
@@ -464,6 +539,56 @@ function main(argv) {
   process.exit(failures ? 1 : 0);
 }
 
+/**
+ * Run one job's steps in order, stopping at the first failure. `out` is a file
+ * descriptor to write to, or null for this terminal.
+ */
+async function runJob(job, ctx, env, out) {
+  const say = (line) => (out === null ? console.log(line) : writeSync(out, `${line}\n`));
+  if (job.where === "skip") {
+    say(`\n── ${job.name}: skipped (CI runs it on ${job.os})`);
+    return { job: job.name, skipped: true, secs: 0 };
+  }
+  const started = Date.now();
+  const stdio = out === null ? "inherit" : ["ignore", out, out];
+  const container = job.where === "container" ? startJobContainer(ctx) : null;
+  if (job.where === "container" && !container) {
+    return { job: job.name, failed: "starting the container", secs: 0 };
+  }
+  let failed = null;
+  for (const step of job.steps) {
+    const skip = skipReason(job, step);
+    if (skip) {
+      say(`\n── ${job.name} › ${step.name}: skipped (${skip})`);
+      continue;
+    }
+    say(
+      `\n── ${job.name} › ${step.name}${job.where === "container" ? " (container)" : ""}\n   [${step.cwd}] ${step.run.replace(/\s*\n\s*/g, " ")}`,
+    );
+    const command = ["bash", "-eo", "pipefail", "-c", step.run];
+    const status =
+      job.where === "container"
+        ? await run(DOCKER, execArgs(ctx, container, step.cwd, command), { stdio })
+        : await run(command[0], command.slice(1), {
+            cwd: path.join(REPO_ROOT, step.cwd),
+            env,
+            stdio,
+          });
+    if (status !== 0) {
+      failed = step.name;
+      break;
+    }
+  }
+  if (container) stopJobContainer(container);
+  const secs = Math.round((Date.now() - started) / 1000);
+  if (out !== null) {
+    console.log(
+      `\n── ${job.name} (this machine): ${failed ? `FAILED at ${failed}` : "ok"} in ${secs}s`,
+    );
+  }
+  return { job: job.name, failed, secs };
+}
+
 /** Why a step doesn't run where this job runs, or null if it does. */
 function skipReason(job, step) {
   if (job.where === "container") {
@@ -472,4 +597,4 @@ function skipReason(job, step) {
   return MUTATES_MACHINE.test(step.run) ? "changes this machine" : null;
 }
 
-main(process.argv.slice(2));
+await main(process.argv.slice(2));

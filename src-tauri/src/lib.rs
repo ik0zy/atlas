@@ -1,6 +1,7 @@
 mod app_icon;
 mod auth;
 mod commands;
+mod keep_awake;
 mod logging;
 #[cfg(target_os = "macos")]
 mod menu;
@@ -198,8 +199,16 @@ pub fn run() {
             // The app icon, before the window shows. Later changes arrive
             // through `notify_settings_changed`.
             app_icon::apply(app.handle(), &migration.manager.effective().app_icon);
+            // Whether `instructionSync` is on as Atlas starts, so switching it
+            // off before any project opens still takes the mirrored blocks out.
+            app.state::<commands::instruction_sync::InstructionSyncState>()
+                .init(migration.manager.effective().instruction_sync);
             let atlas_config: state::AtlasConfigHandle = Arc::new(Mutex::new(migration.manager));
             app.manage(atlas_config.clone());
+            let keep_awake = Arc::new(keep_awake::KeepAwakeManager::new(
+                atlas_config.lock().effective().keep_awake_while_running,
+            ));
+            app.manage(keep_awake);
             commands::atlas_config::start_watcher(app.handle(), atlas_config);
             commands::themes::start_watcher(app.handle());
             commands::git_autofetch::start(app.handle());
@@ -213,9 +222,9 @@ pub fn run() {
             let app_state: AppStateHandle = Arc::new(Mutex::new(loaded));
             app.manage(app_state);
 
-            // Bundled `atlas-self-configure` skill (issue #64): install/
-            // upgrade it into the canonical global skills store so it's
-            // discoverable the same way any other managed skill is.
+            // Bundled skills (`atlas-self-configure`, issue #64; `remember`):
+            // install/upgrade them into the canonical global skills store so
+            // they're discoverable the same way any other managed skill is.
             commands::skills::ensure_bundled_skills();
 
             // Opt-in product telemetry. Inert unless the user has enabled it AND
@@ -364,6 +373,7 @@ pub fn run() {
         .manage(commands::modelchat::ModelChatState::new())
         .manage(FileIndexState::new())
         .manage(GitWatcherState::new())
+        .manage(commands::instruction_sync::InstructionSyncState::new())
         .manage(commands::git_autofetch::GitAutoFetchState::new())
         .manage(RecentFilesState::new())
         .manage(MentionCacheState::new())
@@ -388,6 +398,9 @@ pub fn run() {
                     window.state::<MentionCacheState>().drop_window(label);
                     window
                         .state::<commands::git_autofetch::GitAutoFetchState>()
+                        .drop_window(label);
+                    window
+                        .state::<commands::instruction_sync::InstructionSyncState>()
                         .drop_window(label);
                 }
                 // Coming back to Atlas is when a stale Pull badge misleads.
@@ -573,6 +586,8 @@ pub fn run() {
             commands::git_ops::git_squash_last,
             commands::git_watcher::git_watch_start,
             commands::git_watcher::git_watch_stop,
+            commands::instruction_sync::instruction_sync_start,
+            commands::instruction_sync::instruction_sync_stop,
             commands::capture::capture_detect,
             commands::capture::capture_binding,
             commands::capture::capture_enable,

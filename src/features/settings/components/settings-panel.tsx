@@ -41,6 +41,7 @@ import { updater } from "@/features/updater/lib/updater-api";
 import { useUpdaterStore } from "@/features/updater/stores/updater-store";
 import { useSettingsNav, type SettingsSection } from "../stores/settings-nav-store";
 import { openConfigFile } from "../lib/atlas-config-api";
+import type { AppSettings } from "../lib/app-settings";
 import { useSettingsStore } from "@/features/settings/stores/settings-store";
 import { NotificationsSettings } from "./notifications-settings";
 import { SectionTitle, SettingRow, Toggle } from "./settings-controls";
@@ -386,6 +387,20 @@ function GeneralSettings() {
           onChange={(next) => updateSettings({ enterToSend: next })}
         />
       </SettingRow>
+      <SettingRow
+        label="Keep awake while an agent is working"
+        description={
+          isWindows
+            ? "Keep-awake is currently not supported on Windows."
+            : `Keeps your ${isMac ? "Mac" : "computer"} from sleeping while an agent is working. The display can still turn off.`
+        }
+      >
+        <Toggle
+          checked={!isWindows && settings.keepAwakeWhileRunning}
+          disabled={isWindows}
+          onChange={(next) => updateSettings({ keepAwakeWhileRunning: next })}
+        />
+      </SettingRow>
       <NotificationsSettings />
 
       <SectionTitle title="Behaviour" subtitle="Files, logs and the editor" />
@@ -482,6 +497,42 @@ function GeneralSettings() {
         <Toggle
           checked={settings.adaptiveSuggestions !== "off"}
           onChange={(next) => updateSettings({ adaptiveSuggestions: next ? "agent" : "off" })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Switching agents in a chat"
+        description="What picking another agent does once a chat has a conversation. Start over switches in place with a clean chat. New tab keeps the conversation on screen and opens the new agent beside it. Hand off switches in place and attaches the conversation to your next message, so the new agent picks up where the last one stopped. Every conversation stays in your history."
+      >
+        <select
+          value={settings.agentSwitchBehavior}
+          onChange={(e) =>
+            updateSettings({
+              agentSwitchBehavior: e.target.value as AppSettings["agentSwitchBehavior"],
+            })
+          }
+          className="h-7 rounded-md border border-[var(--border)] bg-[var(--card)] px-2 text-xs text-[var(--foreground)] outline-none"
+        >
+          <option value="reset">Start over</option>
+          <option value="new-tab">New tab</option>
+          <option value="handoff">Hand off</option>
+        </select>
+      </SettingRow>
+      <SettingRow
+        label="Save to memory before switching agents"
+        description="Before you switch agents in a chat that has a conversation, the agent you are leaving is sent /remember, so it saves its decisions and findings to shared memory, and the switch waits for it. Only for agents that offer /remember. Costs one turn per switch; you can switch right away from the notice."
+      >
+        <Toggle
+          checked={settings.rememberBeforeSwitch}
+          onChange={(next) => updateSettings({ rememberBeforeSwitch: next })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Mirror CLAUDE.md and .claude/rules into AGENTS.md"
+        description="For agents that read AGENTS.md. When on, Atlas keeps a marked block in the active project's AGENTS.md with CLAUDE.md and every .claude/rules file, rewritten as they change, and creates AGENTS.md if there is none. Your own text outside the block is never changed. Turning it off removes the block. Hooks and permission lists are not instructions and are not copied."
+      >
+        <Toggle
+          checked={settings.instructionSync}
+          onChange={(next) => updateSettings({ instructionSync: next })}
         />
       </SettingRow>
       <SettingRow

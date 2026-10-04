@@ -101,6 +101,12 @@ uiScale = 1.0
 # Exactly "agent" or "off", nothing else. (default: "agent")
 adaptiveSuggestions = "agent"
 
+# What picking another agent does to a chat that has a conversation:
+# "new-tab" keeps it and opens the new agent in a new tab, "handoff"
+# switches in place and attaches it to the next message, "reset"
+# switches in place and starts over. (default: "reset")
+agentSwitchBehavior = "reset"
+
 # updaterIgnoredVersion: a release you chose to skip in the update
 # prompt. Absent unless one was ignored — TOML has no null, so "unset"
 # means the key simply isn't here. Delete the line to clear it; never
@@ -228,10 +234,14 @@ wrote; `toml_edit` just preserves whatever comments are already there.
 | `iconTheme` | string | `"material-icon-theme"` | a plain id (letters, digits, `.`, `-`, `_`) — it names a directory under `~/.config/atlas/icon-themes/`. `"minimal"` keeps Atlas's lucide icons. See `docs/reference/icon-themes.md` |
 | `appIcon` | string | `"dark"` | a plain id (letters, digits, `-`, `_`) from `src-tauri/icons/app-icons/app-icons.json` — today `"dark"` or `"light"`. An id this Atlas does not ship shows the default without rewriting the file. macOS only: `"dark"` is the bundle's own Liquid Glass icon; any other replaces the Dock icon and the bundle's Finder/Launchpad icon, re-applied at every launch |
 | `adaptiveSuggestions` | `"agent"` \| `"off"` | `"agent"` | exactly one of these two strings |
+| `agentSwitchBehavior` | `"new-tab"` \| `"handoff"` \| `"reset"` | `"reset"` | exactly one of these three strings. An empty chat always switches in place and a running one always gets a new tab, whatever this says |
 | `gitBlameInline` | boolean | `true` | — |
 | `gitAutoFetch` | boolean | `true` | — |
+| `keepAwakeWhileRunning` | boolean | `false` | no effect on Windows |
 | `autoUpdate` | boolean | `true` | — |
 | `curatedPluginSync` | boolean | `false` | — |
+| `instructionSync` | boolean | `false` | — . See [Mirrored instructions](#mirrored-instructions-instructionsync) |
+| `rememberBeforeSwitch` | boolean | `false` | — . Acts only on a chat with a conversation whose agent advertises `/remember` (the bundled `remember` skill); waits at most 3 minutes, and the user can switch at once |
 | `updaterIgnoredVersion` | string, or absent | absent | — |
 | `enterToSend` | boolean | `true` | — |
 | `agentUiNavigation` | boolean | `true` | — |
@@ -269,6 +279,61 @@ the old editor selection was not the matching editor half of the old interface
 theme, its `editor.*`, `syntax.*`, and `diff.*` values become `themeOverrides`
 so the user keeps that deliberate combination. There is no separate editor
 theme after this migration.
+
+### Mirrored instructions (`instructionSync`)
+
+Some agents read a project's instructions from `CLAUDE.md` and
+`.claude/rules/*.md`; others read only `AGENTS.md`. With `instructionSync` on,
+Atlas keeps one marked block in the active project's `AGENTS.md` holding
+`CLAUDE.md`, `.claude/CLAUDE.md` and each rule file, every one followed by the
+project files it imports, for any agent that reads `AGENTS.md`, and rewrites it
+whenever any of those files change. The sources stay the place to edit
+a rule. The block sits between these two lines, each on a line of its own:
+
+```
+<!-- atlas:mirrored-instructions START -->
+<!-- atlas:mirrored-instructions END -->
+```
+
+- **Which projects.** Switching it on syncs and watches the project open in
+  each window, and no other. A project you switch to later is synced when it
+  becomes active. An `AGENTS.md` is created only when there is something to
+  mirror.
+- **Switching it off** stops the watching and takes the block back out of
+  every project Atlas wrote it into, open or not, under the same checks as a
+  sync below. Atlas remembers those projects in `instruction-sync.json` in its
+  app config directory. An `AGENTS.md` that Atlas created and that held
+  nothing but the block is deleted; one you made yourself is kept, even when
+  removing the block leaves it empty. A sync never deletes `AGENTS.md`.
+- **Your text is never changed.** Every byte outside the block, line endings
+  included, stays as it was. The block takes the line ending of the line just
+  before it. Atlas leaves `AGENTS.md` alone, and logs why, when the markers
+  are not exactly one START line followed by one END line (an edited,
+  indented, duplicated or deleted marker), when `CLAUDE.md` or a rule has a
+  marker on a line of its own, when `AGENTS.md` or `CLAUDE.md` is a link or
+  the two are the same file, when `CLAUDE.md` only imports `@AGENTS.md`, when
+  `AGENTS.md` is read-only, and when `AGENTS.md` changes while it is being
+  written (that write is retried from the new text). The last check and the
+  write are two steps, so a save that lands in the instant between them is
+  still overwritten; no portable file operation closes that gap. Links are
+  detected on macOS, Linux and Windows, hard links included.
+- **Pack rules.** A rule a pack projected into `.claude/rules/` is left out
+  when `AGENTS.md` already carries it as that pack's own
+  `<!-- atlas-pack:{pack}:{rule} START -->` block.
+- **Imports.** An `@path` import in any of those files is followed the way
+  Claude Code follows it: relative to the importing file, not inside a code
+  span or code block, up to 5 hops deep. Each imported file gets its own
+  section after the file that imports it, the first time it is imported. Only
+  files inside the project are copied in: an import of `~/…` or of a path
+  outside the project stays as written and is not expanded, since
+  `AGENTS.md` is usually committed. An `@AGENTS.md` import line is left out
+  of the block, where it would point `AGENTS.md` at itself.
+- Some agents stop reading `AGENTS.md` past a size limit (32 KiB is a common
+  default), and the block sits at the end of the file. Atlas logs a warning
+  when a sync leaves `AGENTS.md` larger than that.
+- A rule's `paths:` frontmatter becomes an "applies when working on" line, since
+  `AGENTS.md` has no path scoping. Hooks and permission lists
+  (`.claude/settings.json`) are not instructions and are not mirrored.
 
 ## Schema versioning
 
