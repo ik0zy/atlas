@@ -36,6 +36,7 @@ const SESSION_ENDED: &str = "Your Atlas session ended. Sign in again to reconnec
 /// Managed handle to the auth core.
 pub struct AuthState {
     core: Arc<AuthCore>,
+    config_dir: std::path::PathBuf,
 }
 
 impl AuthState {
@@ -43,14 +44,19 @@ impl AuthState {
         Self {
             core: Arc::new(AuthCore::new(
                 auth_base(),
-                config_dir,
+                config_dir.clone(),
                 reqwest::Client::new(),
             )),
+            config_dir,
         }
     }
 
     pub fn core(&self) -> Arc<AuthCore> {
         Arc::clone(&self.core)
+    }
+
+    fn config_dir(&self) -> &std::path::Path {
+        &self.config_dir
     }
 }
 
@@ -61,7 +67,10 @@ impl AuthState {
 /// - Named with the expected avatar prefix (`avatar-`)
 /// - Has an allowed image extension (png, jpg, jpeg, webp, gif)
 /// - Resolves to an existing regular file
-fn resolve_avatar_grant_path(path: &str) -> Option<std::path::PathBuf> {
+fn resolve_avatar_grant_path(
+    path: &str,
+    allowed_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
         return None;
@@ -74,7 +83,27 @@ fn resolve_avatar_grant_path(path: &str) -> Option<std::path::PathBuf> {
     if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif") {
         return None;
     }
+    // A symlink named `avatar-*.png` could point anywhere — auth tokens,
+    // session state. Canonicalize, then require the *target* to be a regular
+    // file directly inside the avatar cache dir, with an avatar-shaped name
+    // and an image extension. Both sides are canonicalized so symlinked
+    // parents on either side (e.g. /var → /private/var) can't skew the check.
+    let canonical_dir = dunce::canonicalize(allowed_dir).ok()?;
     let canonical = dunce::canonicalize(p).ok()?;
+    if canonical.parent() != Some(canonical_dir.as_path()) {
+        return None;
+    }
+    let resolved_name = canonical.file_name()?.to_str()?;
+    if !resolved_name.starts_with("avatar-") {
+        return None;
+    }
+    let resolved_ext = canonical.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(
+        resolved_ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif"
+    ) {
+        return None;
+    }
     if !canonical.is_file() {
         return None;
     }
@@ -89,7 +118,10 @@ fn resolve_avatar_grant_path(path: &str) -> Option<std::path::PathBuf> {
 /// Explicitly granting the single file via `allow_file` allows the webview to serve the avatar
 /// without broadening scope to the entire config directory (which holds auth tokens and session state).
 fn grant_avatar_file(app: &AppHandle, path: &str) {
-    if let Some(canonical) = resolve_avatar_grant_path(path) {
+    let Some(state) = app.try_state::<AuthState>() else {
+        return;
+    };
+    if let Some(canonical) = resolve_avatar_grant_path(path, state.config_dir()) {
         let _ = app.asset_protocol_scope().allow_file(&canonical);
     }
 }
@@ -610,34 +642,60 @@ mod tests {
     #[test]
     fn resolve_avatar_grant_path_validates_path() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
         let valid_file = temp_dir.path().join("avatar-1234abcd5678ef01.png");
         std::fs::write(&valid_file, b"png data").unwrap();
 
         // Valid cached avatar
-        let resolved = resolve_avatar_grant_path(valid_file.to_str().unwrap());
+        let resolved = resolve_avatar_grant_path(valid_file.to_str().unwrap(), cache_dir);
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap(), dunce::canonicalize(&valid_file).unwrap());
 
         // Relative path rejected
-        assert!(resolve_avatar_grant_path("avatar-1234.png").is_none());
+        assert!(resolve_avatar_grant_path("avatar-1234.png", cache_dir).is_none());
 
         // Missing file rejected
         let missing = temp_dir.path().join("avatar-missing.png");
-        assert!(resolve_avatar_grant_path(missing.to_str().unwrap()).is_none());
+        assert!(resolve_avatar_grant_path(missing.to_str().unwrap(), cache_dir).is_none());
 
         // Wrong filename prefix rejected
         let non_avatar = temp_dir.path().join("photo-1234.png");
         std::fs::write(&non_avatar, b"png").unwrap();
-        assert!(resolve_avatar_grant_path(non_avatar.to_str().unwrap()).is_none());
+        assert!(resolve_avatar_grant_path(non_avatar.to_str().unwrap(), cache_dir).is_none());
 
         // Disallowed extension rejected
         let non_image = temp_dir.path().join("avatar-session.json");
         std::fs::write(&non_image, b"{}").unwrap();
-        assert!(resolve_avatar_grant_path(non_image.to_str().unwrap()).is_none());
+        assert!(resolve_avatar_grant_path(non_image.to_str().unwrap(), cache_dir).is_none());
 
         // Directory rejected
         let dir = temp_dir.path().join("avatar-dir.png");
         std::fs::create_dir(&dir).unwrap();
-        assert!(resolve_avatar_grant_path(dir.to_str().unwrap()).is_none());
+        assert!(resolve_avatar_grant_path(dir.to_str().unwrap(), cache_dir).is_none());
+
+        // Path outside the cache dir rejected even with an avatar-shaped name
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("avatar-e1060a0e8bfc7d4e.png");
+        std::fs::write(&outside, b"png").unwrap();
+        assert!(resolve_avatar_grant_path(outside.to_str().unwrap(), cache_dir).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_avatar_grant_path_rejects_symlink_escape() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let secret = elsewhere.path().join("auth.json");
+        std::fs::write(&secret, b"{}").unwrap();
+        let link = cache_dir.path().join("avatar-evil.png");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(resolve_avatar_grant_path(link.to_str().unwrap(), cache_dir.path()).is_none());
+
+        // Symlink to a non-avatar name inside the cache dir is also rejected
+        let other = cache_dir.path().join("session.json");
+        std::fs::write(&other, b"{}").unwrap();
+        let link2 = cache_dir.path().join("avatar-link2.png");
+        std::os::unix::fs::symlink(&other, &link2).unwrap();
+        assert!(resolve_avatar_grant_path(link2.to_str().unwrap(), cache_dir.path()).is_none());
     }
 }
