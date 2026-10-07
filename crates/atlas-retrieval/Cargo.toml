@@ -5,10 +5,20 @@ edition = "2021"
 description = "The retrieval core memory and the code index share: content-keyed embedding cache codec, per-model usearch vector files that heal, RRF fusion, the Embedder trait."
 
 [dependencies]
-usearch = "2.25.3"
+# No default `usearch` features here: its default `numkong` SIMD backend does
+# not compile with MSVC on Windows ARM64 (x86-only `<immintrin.h>` via
+# auto-enabled ISA targets, and `<processthreadsapi.h>` without `<windows.h>`).
+# With it off, usearch falls back to its own distance kernels
+# (`USEARCH_USE_NUMKONG=0`) behind the same Rust API. Re-enabled for every
+# target but Windows below, so macOS and Linux are unchanged.
+usearch = { version = "2.25.3", default-features = false }
 half = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
+
+# usearch's numkong SIMD backend everywhere it builds (see `usearch` above).
+[target.'cfg(not(windows))'.dependencies]
+usearch = { version = "2.25.3", features = ["numkong"] }
 
 [dev-dependencies]
 tempfile = "3"
