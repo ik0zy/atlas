@@ -1,0 +1,54 @@
+name: Probe sccache env chain
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: 'true'
+  SCCACHE_GHA_RW_MODE: 'READ_ONLY'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Bun and Node
+        uses: jdx/mise-action@v2
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Probe 1 - direct cargo through the wrapper
+        run: |
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
+          which sccache
+          cargo new --bin /tmp/probe1 2>&1 | tail -1
+          cd /tmp/probe1 && cargo build --offline 2>&1 | tail -2
+          echo "--- stats after direct build:"
+          sccache --show-stats 2>&1 | grep -E "Compile requests|Cache hits |Cache misses"
+
+      - name: Install frontend dependencies (for the tauri binary)
+        run: bun install --frozen-lockfile
+
+      - name: Probe 2 - RUSTC_WRAPPER through bun/node/tauri to cargo
+        run: |
+          mkdir -p /tmp/fakecargo
+          printf '#!/bin/sh\necho "FAKECARGO RUSTC_WRAPPER=${RUSTC_WRAPPER-unset}" >> "$GITHUB_WORKSPACE/probe2.log"\nexit 1\n' > /tmp/fakecargo/cargo
+          chmod +x /tmp/fakecargo/cargo
+          export PATH="/tmp/fakecargo:$PATH"
+          echo "--- invoking real chain with fake cargo first on PATH:"
+          node scripts/with-posthog-env.mjs tauri build --bundles none 2>&1 | head -5 || true
+          echo "--- what cargo saw:"
+          cat probe2.log 2>/dev/null || echo "NO FAKE-CARGO INVOCATIONS LOGGED"
+
+      - name: Probe 3 - stats after both probes
+        run: sccache --show-stats 2>&1 | grep -E "Compile requests|Cache hits |Cache misses"
