@@ -32,10 +32,13 @@ jobs:
           echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
           which sccache
           rustc --version
-          cargo new --bin /tmp/probe1 2>&1 | tail -1
-          cd /tmp/probe1 && cargo build --offline -v 2>&1 | grep -m3 -E "^   Compiling|^    Running|Fresh" | head -5
+          export SCCACHE_ERROR_LOG=/tmp/sccache-err.log
+          cargo new --bin /tmp/probe1c 2>&1 | tail -1
+          cd /tmp/probe1c && cargo build --offline 2>&1 | tail -2
+          echo "--- CannotCache reasons (with cmdlines):"
+          grep -a "CannotCache" /tmp/sccache-err.log | head -4 | cut -c1-200
           echo "--- FULL stats after direct build:"
-          sccache --show-stats 2>&1 | grep -aE "requests|hits|misses|errors|cacheable|compilation|Unsupported|Timeouts|Average|Failed|recache|writes|location|Version"
+          sccache --show-stats --stats-format=json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin)['stats']; print(json.dumps({k:v for k,v in d.items() if k!='cache_location'}, indent=1)[:1500])"
 
       - name: Install frontend dependencies (for the tauri binary)
         run: bun install --frozen-lockfile
