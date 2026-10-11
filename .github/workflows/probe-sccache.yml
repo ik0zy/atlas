@@ -31,10 +31,11 @@ jobs:
         run: |
           echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
           which sccache
+          rustc --version
           cargo new --bin /tmp/probe1 2>&1 | tail -1
-          cd /tmp/probe1 && cargo build --offline 2>&1 | tail -2
-          echo "--- stats after direct build:"
-          sccache --show-stats 2>&1 | grep -E "Compile requests|Cache hits |Cache misses"
+          cd /tmp/probe1 && cargo build --offline -v 2>&1 | grep -m3 -E "^   Compiling|^    Running|Fresh" | head -5
+          echo "--- FULL stats after direct build:"
+          sccache --show-stats 2>&1 | grep -aE "requests|hits|misses|errors|cacheable|compilation|Unsupported|Timeouts|Average|Failed|recache|writes|location|Version"
 
       - name: Install frontend dependencies (for the tauri binary)
         run: bun install --frozen-lockfile
@@ -46,9 +47,9 @@ jobs:
           chmod +x /tmp/fakecargo/cargo
           export PATH="/tmp/fakecargo:$PATH"
           echo "--- invoking real chain with fake cargo first on PATH:"
-          node scripts/with-posthog-env.mjs tauri build --bundles none 2>&1 | head -5 || true
+          node scripts/with-posthog-env.mjs tauri build --bundles deb 2>&1 | head -8 || true
           echo "--- what cargo saw:"
           cat probe2.log 2>/dev/null || echo "NO FAKE-CARGO INVOCATIONS LOGGED"
 
-      - name: Probe 3 - stats after both probes
-        run: sccache --show-stats 2>&1 | grep -E "Compile requests|Cache hits |Cache misses"
+      - name: Probe 3 - FULL stats after both probes
+        run: sccache --show-stats 2>&1 | grep -aE "requests|hits|misses|errors|cacheable|compilation|Unsupported|Timeouts|Average|Failed|recache|writes|location|Version"
